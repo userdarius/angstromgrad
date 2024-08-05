@@ -3,13 +3,21 @@ use std::rc::Rc;
 use std::ops::{Add, Mul, Sub, Div};
 
 
-#[derive(Debug, Clone, Copy)]
-struct Value{
+// Note to self, refcell is not thread safe so use Arc for multithreaded applications
+#[derive(Clone)]
+pub struct Value{
     data: f64,
     grad: f64,
-    _backward: Rc<RefCell<dyn FnMut()>>,
+    _backward: Rc<RefCell<dyn FnMut() + 'static>>, // refcell for interior mutability i.e. gradient param update etc
     _prev: Vec<Rc<Value>>,   
     _op: Option<String>, 
+}
+
+// don't know exactly what this does but it's needed for the debug trait 
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Value {{ data: {}, grad: {}, _backward: <function>, _prev: {:?}, _op: {:?} }}", self.data, self.grad, self._prev, self._op)
+    }
 }
 
 impl Value {
