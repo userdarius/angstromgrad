@@ -1,164 +1,182 @@
 use crate::engine::Value;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
-use rand::{thread_rng, Rng};
-
-#[derive(Clone)] // use the clone method to create a new instance of the struct
-pub struct Neuron {
-    w: Vec<Value>,
-    b: Value,
-}
-
-#[derive(Clone)] // use the clone method to create a new instance of the struct
-pub struct Layer {
-    neurons: Vec<Neuron>,
-}
-
-#[derive(Clone)] // use the clone method to create a new instance of the struct
-pub struct MLP {
-    layers: Vec<Layer>,
-}
-
+/// Shared behavior for trainable components.
 pub trait Module {
-    // Retrieve all trainable parameters as a vector.
-    fn parameters(&self) -> Vec<&Value>;
+    /// Returns all trainable parameters owned by this module.
+    fn parameters(&self) -> Vec<Value>;
 
-    // Perform a forward pass through the module.
-    fn forward(&self, inputs: &[Value]) -> Vec<Value>;
+    /// Clears the gradient on every trainable parameter.
+    fn zero_grad(&self) {
+        for parameter in self.parameters() {
+            parameter.zero_grad();
+        }
+    }
 }
 
+#[derive(Clone, Debug)]
+pub struct Neuron {
+    weights: Vec<Value>,
+    bias: Value,
+}
 
 impl Neuron {
-
-    /// Constructs a new `Neuron` with randomly initialized weights and a bias.
-    ///
-    /// # Parameters
-    /// - `nin`: The number of input connections (features) to the neuron.
-    ///
-    /// # Returns
-    /// Returns a `Neuron` instance with `nin` weights and one bias, all initialized to random values between -1.0 and 1.0.
-    pub fn new(nin: usize) -> Neuron {
-        let mut rng = thread_rng();
-        let mut rand_value_fn = || {
-            let data = rng.gen_range(-1.0..1.0);
-            Value::from(data)
-        };
-
-        let mut w = Vec::new();
-        for _ in 0..nin {
-            w.push(rand_value_fn());
-        }
-
-        Neuron {
-            w,
-            b: rand_value_fn().add_label("b"),
-        }
+    /// Constructs a neuron with weights and bias sampled uniformly from `-1..1`.
+    pub fn new(input_count: usize) -> Self {
+        Self::with_rng(input_count, &mut rand::rng())
     }
 
-    /// Performs a forward pass of the neuron using the given inputs.
-    ///
-    /// # Parameters
-    /// - `xs`: A vector of `Value` representing the inputs to the neuron.
-    ///
-    /// # Returns
-    /// The output of the neuron as a `Value`, applying the tanh activation function to the weighted sum of inputs plus the bias.
-    
-    pub fn forward(&self, xs: &Vec<Value>) -> Value {
-        let products = std::iter::zip(&self.w, xs)
-            .map(|(a, b)| a * b)
-            .collect::<Vec<Value>>();
-
-        let sum = self.b.clone() + products.into_iter().reduce(|acc, prd| acc + prd).unwrap();
-        sum.tanh()
+    /// Constructs a reproducibly initialized neuron.
+    pub fn with_seed(input_count: usize, seed: u64) -> Self {
+        Self::with_rng(input_count, &mut StdRng::seed_from_u64(seed))
     }
 
-    /// Retrieves all parameters (weights and bias) of the neuron.
+    fn with_rng<R: Rng + ?Sized>(input_count: usize, rng: &mut R) -> Self {
+        let mut random_value = || Value::from(rng.random_range(-1.0..1.0));
+        let weights = (0..input_count).map(|_| random_value()).collect();
+        let bias = random_value().add_label("bias");
+        Self { weights, bias }
+    }
+
+    /// Computes `tanh(weights · inputs + bias)`.
     ///
-    /// # Returns
-    /// A vector of `Value` containing the neuron's bias followed by its weights.
+    /// # Panics
+    ///
+    /// Panics when the number of inputs does not match the neuron's weights.
+    pub fn forward(&self, inputs: &[Value]) -> Value {
+        assert_eq!(
+            inputs.len(),
+            self.weights.len(),
+            "expected {} inputs, received {}",
+            self.weights.len(),
+            inputs.len()
+        );
+
+        let activation = self
+            .weights
+            .iter()
+            .zip(inputs)
+            .map(|(weight, input)| weight * input)
+            .fold(self.bias.clone(), |sum, product| sum + product);
+        activation.tanh()
+    }
+
     pub fn parameters(&self) -> Vec<Value> {
-        [self.b.clone()]
-            .into_iter()
-            .chain(self.w.clone())
+        <Self as Module>::parameters(self)
+    }
+
+    pub fn zero_grad(&self) {
+        <Self as Module>::zero_grad(self);
+    }
+}
+
+impl Module for Neuron {
+    fn parameters(&self) -> Vec<Value> {
+        self.weights
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.bias.clone()))
             .collect()
     }
 }
 
-impl MLP {
-    /// Constructs a new `MLP` (Multi-Layer Perceptron) network.
-    ///
-    /// # Parameters
-    /// - `nin`: The number of inputs to the network.
-    /// - `nout`: A vector specifying the number of neurons in each layer of the network.
-    ///
-    /// # Returns
-    /// Returns an `MLP` instance with layers defined by `nin` and `nout`.
-    pub fn new(nin: usize, nout: Vec<usize>) -> MLP {
-        let nout_len = nout.len();
-        let layer_sizes: Vec<usize> = [nin].into_iter().chain(nout).collect();
-
-        MLP {
-            layers: (0..nout_len)
-                .map(|i| Layer::new(layer_sizes[i], layer_sizes[i + 1]))
-                .collect(),
-        }
-    }
-
-    /// Performs a forward pass through the entire MLP network.
-    ///
-    /// # Parameters
-    /// - `xs`: A vector of `Value` representing the input to the network.
-    ///
-    /// # Returns
-    /// A vector of `Value` representing the output from the final layer of the network.
-    pub fn forward(&self, mut xs: Vec<Value>) -> Vec<Value> {
-        for layer in &self.layers {
-            xs = layer.forward(&xs);
-        }
-        xs
-    }
-
-    /// Retrieves all trainable parameters from every layer of the MLP.
-    ///
-    /// # Returns
-    /// A flattened vector of `Value` containing all the parameters of the network.
-    pub fn parameters(&self) -> Vec<Value> {
-        self.layers.iter().flat_map(|l| l.parameters()).collect()
-    }
+#[derive(Clone, Debug)]
+pub struct Layer {
+    neurons: Vec<Neuron>,
 }
 
 impl Layer {
-    /// Constructs a new `Layer` consisting of multiple neurons.
-    ///
-    /// # Parameters
-    /// - `nin`: The number of inputs each neuron in the layer should accept.
-    /// - `nout`: The number of neurons in the layer.
-    ///
-    /// # Returns
-    /// Returns a `Layer` instance containing `nout` neurons, each with `nin` inputs.
-    pub fn new(nin: usize, nout: usize) -> Layer {
-        Layer {
-            neurons: (0..nout)
-                .map(|_| Neuron::new(nin))
-                .collect(),
-        }
+    /// Constructs a layer containing `output_count` neurons.
+    pub fn new(input_count: usize, output_count: usize) -> Self {
+        Self::with_rng(input_count, output_count, &mut rand::rng())
     }
 
-    /// Performs a forward pass through the layer using the given inputs.
-    ///
-    /// # Parameters
-    /// - `xs`: A vector of `Value` representing the inputs to the layer.
-    ///
-    /// # Returns
-    /// A vector of `Value` representing the output from each neuron in the layer.
-    pub fn forward(&self, xs: &Vec<Value>) -> Vec<Value> {
-        self.neurons.iter().map(|n| n.forward(xs)).collect()
+    /// Constructs a reproducibly initialized layer.
+    pub fn with_seed(input_count: usize, output_count: usize, seed: u64) -> Self {
+        Self::with_rng(input_count, output_count, &mut StdRng::seed_from_u64(seed))
     }
 
-    /// Retrieves all parameters (weights and biases) from all neurons in the layer.
-    ///
-    /// # Returns
-    /// A flattened vector of `Value` containing all the parameters of the layer.
+    fn with_rng<R: Rng + ?Sized>(input_count: usize, output_count: usize, rng: &mut R) -> Self {
+        let neurons = (0..output_count)
+            .map(|_| Neuron::with_rng(input_count, rng))
+            .collect();
+        Self { neurons }
+    }
+
+    pub fn forward(&self, inputs: &[Value]) -> Vec<Value> {
+        self.neurons
+            .iter()
+            .map(|neuron| neuron.forward(inputs))
+            .collect()
+    }
+
     pub fn parameters(&self) -> Vec<Value> {
-        self.neurons.iter().flat_map(|n| n.parameters()).collect()
+        <Self as Module>::parameters(self)
+    }
+
+    pub fn zero_grad(&self) {
+        <Self as Module>::zero_grad(self);
+    }
+}
+
+impl Module for Layer {
+    fn parameters(&self) -> Vec<Value> {
+        self.neurons.iter().flat_map(Module::parameters).collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MLP {
+    layers: Vec<Layer>,
+}
+
+impl MLP {
+    /// Constructs a multi-layer perceptron.
+    ///
+    /// `layer_sizes` contains the output width of each successive layer.
+    pub fn new(input_count: usize, layer_sizes: Vec<usize>) -> Self {
+        Self::with_rng(input_count, &layer_sizes, &mut rand::rng())
+    }
+
+    /// Constructs a reproducibly initialized multi-layer perceptron.
+    pub fn with_seed(input_count: usize, layer_sizes: Vec<usize>, seed: u64) -> Self {
+        Self::with_rng(input_count, &layer_sizes, &mut StdRng::seed_from_u64(seed))
+    }
+
+    fn with_rng<R: Rng + ?Sized>(input_count: usize, layer_sizes: &[usize], rng: &mut R) -> Self {
+        let mut previous_size = input_count;
+        let layers = layer_sizes
+            .iter()
+            .map(|&size| {
+                let layer = Layer::with_rng(previous_size, size, rng);
+                previous_size = size;
+                layer
+            })
+            .collect();
+        Self { layers }
+    }
+
+    /// Performs a forward pass. Both owned vectors and slices are accepted.
+    pub fn forward(&self, inputs: impl AsRef<[Value]>) -> Vec<Value> {
+        let mut outputs = inputs.as_ref().to_vec();
+        for layer in &self.layers {
+            outputs = layer.forward(&outputs);
+        }
+        outputs
+    }
+
+    pub fn parameters(&self) -> Vec<Value> {
+        <Self as Module>::parameters(self)
+    }
+
+    pub fn zero_grad(&self) {
+        <Self as Module>::zero_grad(self);
+    }
+}
+
+impl Module for MLP {
+    fn parameters(&self) -> Vec<Value> {
+        self.layers.iter().flat_map(Module::parameters).collect()
     }
 }

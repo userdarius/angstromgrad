@@ -1,279 +1,431 @@
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::iter::Sum;
-use std::ops::{Add, Deref, Mul, Neg, Sub};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::rc::Rc;
 
-use std::collections::HashSet;
-use std::fmt::Debug;
-use std::hash::Hash;
+type PropagateFn = fn(&Node);
 
-type PropagateFn = fn(value: &Ref<_Value>);
-
-pub struct _Value {
+struct Node {
     data: f64,
     grad: f64,
-    _op: Option<String>,
-    _prev: Vec<Value>,
+    op: Option<&'static str>,
+    prev: Vec<Value>,
     propagate: Option<PropagateFn>,
     label: Option<String>,
 }
 
-impl _Value {
+impl Node {
     fn new(
         data: f64,
         label: Option<String>,
-        op: Option<String>,
+        op: Option<&'static str>,
         prev: Vec<Value>,
         propagate: Option<PropagateFn>,
-    ) -> _Value {
-        _Value {
-            data, // the actual numerical value
-            grad: 0.0, // gradient of the value with respect to some loss
-            label, // optional label for the value
-            _op: op, // optional string to describe the operation that created this value
-            _prev: prev, // vector of previous _Value instances linked to this value
-            propagate, // optional function for propagating gradients back through the network
+    ) -> Self {
+        Self {
+            data,
+            grad: 0.0,
+            label,
+            op,
+            prev,
+            propagate,
         }
     }
 }
 
-// check if two values are equal by comparing their attributes
-impl PartialEq for _Value {
-    fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
-            && self.grad == other.grad
-            && self.label == other.label
-            && self._op == other._op
-            && self._prev == other._prev
-    }
-}
-
-impl Eq for _Value {}
-
-impl Hash for _Value {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.data.to_bits().hash(state);
-        self.grad.to_bits().hash(state);
-        self.label.hash(state);
-        self._op.hash(state);
-        self._prev.hash(state);
-    }
-}
-
-// Don't really know why we need this 
-impl Debug for _Value {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("_Value")
-            .field("data", &self.data)
-            .field("grad", &self.grad)
-            .field("label", &self.label)
-            .field("_op", &self._op)
-            .field("_prev", &self._prev)
-            .finish()
-    }
-}
-
-// Wrapper around _Value to allow for multiple references to the same _Value instance 
-// while allowing for interior mutability by using Rc<RefCell<...>>  
-#[derive(Clone, Eq, PartialEq, Debug)]
-pub struct Value(Rc<RefCell<_Value>>);
+/// A scalar value and its node in a dynamically constructed computation graph.
+///
+/// Cloning a `Value` is cheap: clones refer to the same graph node and therefore
+/// observe the same data and gradient.
+#[derive(Clone)]
+pub struct Value(Rc<RefCell<Node>>);
 
 impl Value {
-   
-    pub fn from<T>(t: T) -> Value
-    where
-        T: Into<Value>,
-    {
-        t.into()
+    fn new(node: Node) -> Self {
+        Self(Rc::new(RefCell::new(node)))
     }
 
-    // A new `Value` that wraps the given `_Value` in `Rc<RefCell<_Value>>`.
-    fn new(value: _Value) -> Value {
-        Value(Rc::new(RefCell::new(value)))
-    }
-
-    // recursively applies the propagation function defined in `_Value` nodes.
+    /// Runs reverse-mode automatic differentiation from this value.
+    ///
+    /// Gradients accumulate into leaf nodes. Call [`Value::zero_grad`] (or
+    /// [`crate::nn::Module::zero_grad`] for a network) before a new optimization
+    /// step when accumulation is not desired. Intermediate gradients are reset
+    /// on each call so reusing a graph does not propagate stale values.
     pub fn backward(&self) {
-        let mut visited: HashSet<Value> = HashSet::new();
+        fn build_topology(value: &Value, visited: &mut HashSet<usize>, topology: &mut Vec<Value>) {
+            let identity = Rc::as_ptr(&value.0) as usize;
+            if !visited.insert(identity) {
+                return;
+            }
 
-        self.borrow_mut().grad = 1.0;
+            let predecessors = value.0.borrow().prev.clone();
+            for predecessor in predecessors {
+                build_topology(&predecessor, visited, topology);
+            }
+            topology.push(value.clone());
+        }
 
-        fn _backward(visited: &mut HashSet<Value>, value: &Value) {
-            if !visited.contains(&value) {
-                visited.insert(value.clone());
+        let mut topology = Vec::new();
+        build_topology(self, &mut HashSet::new(), &mut topology);
 
-                let borrowed_value = value.borrow();
-                if let Some(propagate_fn) = borrowed_value.propagate {
-                    propagate_fn(&borrowed_value);
-                }
-
-                for child_id in &value.borrow()._prev {
-                    _backward(visited, child_id);
-                }
+        for value in &topology {
+            let mut node = value.0.borrow_mut();
+            if node.propagate.is_some() {
+                node.grad = 0.0;
             }
         }
 
-        _backward(&mut visited, self);
-    }
-    
-    pub fn pow(&self, other: &Value) -> Value {
-        let result = self.borrow().data.powf(other.borrow().data);
+        let mut root = self.0.borrow_mut();
+        if root.propagate.is_some() {
+            root.grad = 1.0;
+        } else {
+            root.grad += 1.0;
+        }
+        drop(root);
 
-        let propagate_fn: PropagateFn = |value| {
-            let mut base = value._prev[0].borrow_mut();
-            let power = value._prev[1].borrow();
-            base.grad += power.data * (base.data.powf(power.data - 1.0)) * value.grad;
+        for value in topology.into_iter().rev() {
+            let node = value.0.borrow();
+            if let Some(propagate) = node.propagate {
+                propagate(&node);
+            }
+        }
+    }
+
+    /// Raises this value to a differentiable scalar exponent.
+    pub fn pow(&self, exponent: &Value) -> Value {
+        let result = self.data().powf(exponent.data());
+
+        let propagate: PropagateFn = |node| {
+            let grad = node.grad;
+            let base_data = node.prev[0].data();
+            let exponent_data = node.prev[1].data();
+
+            node.prev[0].0.borrow_mut().grad +=
+                exponent_data * base_data.powf(exponent_data - 1.0) * grad;
+            node.prev[1].0.borrow_mut().grad += node.data * base_data.ln() * grad;
         };
 
-        Value::new(_Value::new(
+        Value::new(Node::new(
             result,
             None,
-            Some("^".to_string()),
-            vec![self.clone(), other.clone()],
-            Some(propagate_fn),
+            Some("pow"),
+            vec![self.clone(), exponent.clone()],
+            Some(propagate),
         ))
     }
 
+    /// Raises this value to a constant floating-point exponent.
+    pub fn powf(&self, exponent: f64) -> Value {
+        let result = self.data().powf(exponent);
+        let propagate: PropagateFn = |node| {
+            let exponent = node.prev[1].data();
+            let base = node.prev[0].data();
+            node.prev[0].0.borrow_mut().grad += exponent * base.powf(exponent - 1.0) * node.grad;
+        };
+
+        Value::new(Node::new(
+            result,
+            None,
+            Some("powf"),
+            vec![self.clone(), Value::from(exponent)],
+            Some(propagate),
+        ))
+    }
+
+    /// Applies the hyperbolic tangent activation function.
     pub fn tanh(&self) -> Value {
-        let result = self.borrow().data.tanh();
+        let result = self.data().tanh();
 
-        let propagate_fn: PropagateFn = |value| {
-            let mut _prev = value._prev[0].borrow_mut();
-            _prev.grad += (1.0 - value.data.powf(2.0)) * value.grad;
+        let propagate: PropagateFn = |node| {
+            node.prev[0].0.borrow_mut().grad += (1.0 - node.data.powi(2)) * node.grad;
         };
 
-        Value::new(_Value::new(
+        Value::new(Node::new(
             result,
             None,
-            Some("tanh".to_string()),
+            Some("tanh"),
             vec![self.clone()],
-            Some(propagate_fn),
+            Some(propagate),
         ))
     }
 
-    pub fn add_label(self, label: &str) -> Value {
-        self.borrow_mut().label = Some(label.to_string());
+    /// Applies the rectified linear unit activation function.
+    pub fn relu(&self) -> Value {
+        let result = self.data().max(0.0);
+        let propagate: PropagateFn = |node| {
+            if node.data > 0.0 {
+                node.prev[0].0.borrow_mut().grad += node.grad;
+            }
+        };
+
+        Value::new(Node::new(
+            result,
+            None,
+            Some("relu"),
+            vec![self.clone()],
+            Some(propagate),
+        ))
+    }
+
+    /// Applies the logistic sigmoid activation function.
+    pub fn sigmoid(&self) -> Value {
+        let input = self.data();
+        let result = if input >= 0.0 {
+            1.0 / (1.0 + (-input).exp())
+        } else {
+            let exp = input.exp();
+            exp / (1.0 + exp)
+        };
+        let propagate: PropagateFn = |node| {
+            node.prev[0].0.borrow_mut().grad += node.data * (1.0 - node.data) * node.grad;
+        };
+
+        Value::new(Node::new(
+            result,
+            None,
+            Some("sigmoid"),
+            vec![self.clone()],
+            Some(propagate),
+        ))
+    }
+
+    /// Applies the exponential function.
+    pub fn exp(&self) -> Value {
+        let result = self.data().exp();
+        let propagate: PropagateFn = |node| {
+            node.prev[0].0.borrow_mut().grad += node.data * node.grad;
+        };
+
+        Value::new(Node::new(
+            result,
+            None,
+            Some("exp"),
+            vec![self.clone()],
+            Some(propagate),
+        ))
+    }
+
+    /// Adds a human-readable label, useful while inspecting a graph.
+    pub fn add_label(self, label: impl Into<String>) -> Value {
+        self.0.borrow_mut().label = Some(label.into());
         self
     }
 
+    /// Returns the scalar's current numerical value.
     pub fn data(&self) -> f64 {
-        self.borrow().data
+        self.0.borrow().data
     }
 
+    /// Returns the accumulated gradient.
     pub fn grad(&self) -> f64 {
-        self.borrow().grad
+        self.0.borrow().grad
     }
 
+    /// Clears this node's accumulated gradient.
     pub fn zero_grad(&self) {
-        self.borrow_mut().grad = 0.0;
+        self.0.borrow_mut().grad = 0.0;
     }
 
+    /// Applies an in-place gradient update: `data += factor * grad`.
     pub fn adjust(&self, factor: f64) {
-        let mut value = self.borrow_mut();
-        value.data += factor * value.grad;
+        let mut node = self.0.borrow_mut();
+        node.data += factor * node.grad;
     }
 }
 
-// Create a hashed value for the `Value` instance based on the inner `_Value` instance.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Value {}
+
 impl Hash for Value {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.borrow().hash(state);
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Rc::as_ptr(&self.0).hash(state);
     }
 }
 
-// Provides dereference access to the Rc<RefCell<_Value>>. A reference to the inner storage of the `Value`.
-impl Deref for Value {
-    type Target = Rc<RefCell<_Value>>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl fmt::Debug for Value {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let node = self.0.borrow();
+        formatter
+            .debug_struct("Value")
+            .field("data", &node.data)
+            .field("grad", &node.grad)
+            .field("label", &node.label)
+            .field("op", &node.op)
+            .finish_non_exhaustive()
     }
 }
-// Converts a type that can be cast into a floating point number directly into a `Value`.
+
+impl fmt::Display for Value {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.data().fmt(formatter)
+    }
+}
+
 impl<T: Into<f64>> From<T> for Value {
-    fn from(t: T) -> Value {
-        Value::new(_Value::new(t.into(), None, None, Vec::new(), None))
+    fn from(value: T) -> Self {
+        Value::new(Node::new(value.into(), None, None, Vec::new(), None))
     }
 }
 
-// Allows to add two Value instances without consuming them. 
-// Instead, it takes references to self and other, allowing to reuse the original Value instances after the addition.
-impl<'a, 'b> Add<&'b Value> for &'a Value {
-    type Output = Value;
-    fn add(self, other: &'b Value) -> Self::Output {
-        add(self, other)
-    }
-}
-
-fn add(a: &Value, b: &Value) -> Value {
-    let result = a.borrow().data + b.borrow().data;
-
-    let propagate_fn: PropagateFn = |value| {
-        let mut first = value._prev[0].borrow_mut();
-        let mut second = value._prev[1].borrow_mut();
-
-        first.grad += value.grad;
-        second.grad += value.grad;
+fn add(left: &Value, right: &Value) -> Value {
+    let result = left.data() + right.data();
+    let propagate: PropagateFn = |node| {
+        let grad = node.grad;
+        node.prev[0].0.borrow_mut().grad += grad;
+        node.prev[1].0.borrow_mut().grad += grad;
     };
 
-    Value::new(_Value::new(
+    Value::new(Node::new(
         result,
         None,
-        Some("+".to_string()),
-        vec![a.clone(), b.clone()],
-        Some(propagate_fn),
+        Some("+"),
+        vec![left.clone(), right.clone()],
+        Some(propagate),
     ))
 }
 
-
-impl<'a, 'b> Mul<&'b Value> for &'a Value {
-    type Output = Value;
-
-    fn mul(self, other: &'b Value) -> Self::Output {
-        mul(self, other)
-    }
-}
-
-// the gradient of the result is multiplied by the other operand's value before being propagated back.
-fn mul(a: &Value, b: &Value) -> Value {
-    let result = a.borrow().data * b.borrow().data;
-
-    let propagate_fn: PropagateFn = |value| {
-        let mut first = value._prev[0].borrow_mut();
-        let mut second = value._prev[1].borrow_mut();
-
-        first.grad += second.data * value.grad;
-        second.grad += first.data * value.grad;
+fn mul(left: &Value, right: &Value) -> Value {
+    let left_data = left.data();
+    let right_data = right.data();
+    let propagate: PropagateFn = |node| {
+        let grad = node.grad;
+        let left_data = node.prev[0].data();
+        let right_data = node.prev[1].data();
+        node.prev[0].0.borrow_mut().grad += right_data * grad;
+        node.prev[1].0.borrow_mut().grad += left_data * grad;
     };
 
-    Value::new(_Value::new(
-        result,
+    Value::new(Node::new(
+        left_data * right_data,
         None,
-        Some("*".to_string()),
-        vec![a.clone(), b.clone()],
-        Some(propagate_fn),
+        Some("*"),
+        vec![left.clone(), right.clone()],
+        Some(propagate),
     ))
 }
 
-impl<'a> Neg for &'a Value {
-    type Output = Value;
-    fn neg(self) -> Self::Output {
-        mul(self, &Value::from(-1))
-    }
+fn sub(left: &Value, right: &Value) -> Value {
+    add(left, &-right)
 }
 
-// Sums all elements in an iterator over `Value` and returns a single `Value` representing the sum.
-impl Sum for Value {
-   
-    fn sum<I: Iterator<Item = Self>>(mut iter: I) -> Self {
-        let mut sum = Value::from(0.0);
-        loop {
-            let val = iter.next();
-            if val.is_none() {
-                break;
+fn div(left: &Value, right: &Value) -> Value {
+    mul(left, &right.powf(-1.0))
+}
+
+macro_rules! impl_binary_operator {
+    ($trait:ident, $method:ident, $function:ident) => {
+        impl $trait<Value> for Value {
+            type Output = Value;
+
+            fn $method(self, rhs: Value) -> Self::Output {
+                $function(&self, &rhs)
             }
-
-            sum = sum + val.unwrap();
         }
-        sum
+
+        impl $trait<&Value> for Value {
+            type Output = Value;
+
+            fn $method(self, rhs: &Value) -> Self::Output {
+                $function(&self, rhs)
+            }
+        }
+
+        impl $trait<Value> for &Value {
+            type Output = Value;
+
+            fn $method(self, rhs: Value) -> Self::Output {
+                $function(self, &rhs)
+            }
+        }
+
+        impl $trait<&Value> for &Value {
+            type Output = Value;
+
+            fn $method(self, rhs: &Value) -> Self::Output {
+                $function(self, rhs)
+            }
+        }
+    };
+}
+
+impl_binary_operator!(Add, add, add);
+impl_binary_operator!(Mul, mul, mul);
+impl_binary_operator!(Sub, sub, sub);
+impl_binary_operator!(Div, div, div);
+
+impl Neg for Value {
+    type Output = Value;
+
+    fn neg(self) -> Self::Output {
+        mul(&self, &Value::from(-1.0))
+    }
+}
+
+impl Neg for &Value {
+    type Output = Value;
+
+    fn neg(self) -> Self::Output {
+        mul(self, &Value::from(-1.0))
+    }
+}
+
+macro_rules! impl_scalar_operator {
+    ($trait:ident, $method:ident, $function:ident) => {
+        impl $trait<f64> for Value {
+            type Output = Value;
+
+            fn $method(self, rhs: f64) -> Self::Output {
+                $function(&self, &Value::from(rhs))
+            }
+        }
+
+        impl $trait<f64> for &Value {
+            type Output = Value;
+
+            fn $method(self, rhs: f64) -> Self::Output {
+                $function(self, &Value::from(rhs))
+            }
+        }
+
+        impl $trait<Value> for f64 {
+            type Output = Value;
+
+            fn $method(self, rhs: Value) -> Self::Output {
+                $function(&Value::from(self), &rhs)
+            }
+        }
+
+        impl $trait<&Value> for f64 {
+            type Output = Value;
+
+            fn $method(self, rhs: &Value) -> Self::Output {
+                $function(&Value::from(self), rhs)
+            }
+        }
+    };
+}
+
+impl_scalar_operator!(Add, add, add);
+impl_scalar_operator!(Mul, mul, mul);
+impl_scalar_operator!(Sub, sub, sub);
+impl_scalar_operator!(Div, div, div);
+
+impl Sum for Value {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Value::from(0.0), |sum, value| sum + value)
+    }
+}
+
+impl<'a> Sum<&'a Value> for Value {
+    fn sum<I: Iterator<Item = &'a Value>>(iter: I) -> Self {
+        iter.fold(Value::from(0.0), |sum, value| sum + value)
     }
 }

@@ -2,5 +2,11 @@
 name = "angstromgrad"
 version = "0.1.0"
 edition = "2021"
+description = "A tiny scalar reverse-mode automatic differentiation engine"
+repository = "https://github.com/userdarius/angstromgrad"
+readme = "README.md"
+keywords = ["autodiff", "neural-network", "machine-learning"]
+categories = ["science"]
 
 [dependencies]
+rand = "0.9.2"
